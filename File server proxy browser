@@ -1,0 +1,432 @@
+/*
+ * File manager part of this code taken from the FSBrowser sample, part of the ESP8266WebServer library for Arduino environment. Copyright (c) 2015 Hristo Gochkov. All rights reserved.
+ * This code also contains excerpts of the examples included in the libraries used, as well as inputs on the esp8266.com forums.
+ * Special thanks go to @martinayotte & @igrr for thir insightful help
+ */
+
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <FS.h>
+
+#define SERIAL_DEBUG Serial
+
+#define MAX_CACHE_ITEMS 10
+#define CACHE_TTL 1*60*1000 // 1 minute
+
+String cachedUrl[MAX_CACHE_ITEMS]; // Urls cached in SPIFFS
+long   cacheTime[MAX_CACHE_ITEMS];  // To store time the actual page was last fetched
+String cacheContentType[MAX_CACHE_ITEMS]; // To store the Content-Type of files in cache
+
+const char* ssid = "********";
+const char* password = "********";
+ 
+ESP8266WebServer server(80);
+//holds the current upload
+File fsUploadFile;
+
+uint8_t buffer[5840];
+
+
+//format bytes
+String formatBytes(size_t bytes){
+  if (bytes < 1024){
+    return String(bytes)+"B";
+  } else if(bytes < (1024 * 1024)){
+    return String(bytes/1024.0)+"KB";
+  } else if(bytes < (1024 * 1024 * 1024)){
+    return String(bytes/1024.0/1024.0)+"MB";
+  } else {
+    return String(bytes/1024.0/1024.0/1024.0)+"GB";
+  }
+}
+
+// From https://github.com/zenmanenergy/ESP8266-Arduino-Examples/blob/master/helloWorld_urlencoded/urlencode.ino
+unsigned char h2int(char c) {
+  if (c >= '0' && c <='9'){
+    return((unsigned char)c - '0');
+  }
+  if (c >= 'a' && c <='f'){
+    return((unsigned char)c - 'a' + 10);
+  }
+  if (c >= 'A' && c <='F'){
+    return((unsigned char)c - 'A' + 10);
+  }
+  return(0);
+}
+
+// From https://github.com/zenmanenergy/ESP8266-Arduino-Examples/blob/master/helloWorld_urlencoded/urlencode.ino
+String urlDecode(String str) {    
+  String encodedString="";
+  char c;
+  char code0;
+  char code1;
+  for (int i = 0; i < str.length(); i++) {
+    c=str.charAt(i);
+    if (c == '+'){
+      encodedString+=' ';  
+    }
+    else if (c == '%') {
+      i++;
+      code0=str.charAt(i);
+      i++;
+      code1=str.charAt(i);
+      c = (h2int(code0) << 4) | h2int(code1);
+      encodedString+=c;
+    }
+    else {        
+      encodedString+=c;  
+    }
+  }    
+  return encodedString;
+}
+
+// From http://hardwarefun.com/tutorials/url-encoding-in-arduino
+String URLEncode(const char* msg) {
+    const char *hex = "0123456789abcdef";
+    String encodedMsg = "";
+
+    while (*msg!='\0'){
+        if( ('a' <= *msg && *msg <= 'z')
+                || ('A' <= *msg && *msg <= 'Z')
+                || ('0' <= *msg && *msg <= '9') ) {
+            encodedMsg += *msg;
+        } else {
+            encodedMsg += '%';
+            encodedMsg += hex[*msg >> 4];
+            encodedMsg += hex[*msg & 15];
+        }
+        msg++;
+    }
+    return encodedMsg;
+}
+
+String getContentType(String filename){
+  if(server.hasArg("download")) return "application/octet-stream";
+  else if(filename.endsWith(".htm")) return "text/html";
+  else if(filename.endsWith(".html")) return "text/html";
+  else if(filename.endsWith(".css")) return "text/css";
+  else if(filename.endsWith(".js")) return "application/javascript";
+  else if(filename.endsWith(".png")) return "image/png";
+  else if(filename.endsWith(".gif")) return "image/gif";
+  else if(filename.endsWith(".jpg")) return "image/jpeg";
+  else if(filename.endsWith(".ico")) return "image/x-icon";
+  else if(filename.endsWith(".xml")) return "text/xml";
+  else if(filename.endsWith(".pdf")) return "application/x-pdf";
+  else if(filename.endsWith(".zip")) return "application/x-zip";
+  else if(filename.endsWith(".gz")) return "application/x-gzip";
+  return "text/plain";
+}
+
+
+void handleFileUpload(){
+  if(server.uri() != "/edit") return;
+  HTTPUpload& upload = server.upload();
+  if(upload.status == UPLOAD_FILE_START){
+    String filename = upload.filename;
+    if(!filename.startsWith("/")) filename = "/"+filename;
+    SERIAL_DEBUG.print("handleFileUpload Name: "); SERIAL_DEBUG.println(filename);
+    fsUploadFile = SPIFFS.open(filename, "w");
+    filename = String();
+  } else if(upload.status == UPLOAD_FILE_WRITE){
+    //SERIAL_DEBUG.print("handleFileUpload Data: "); SERIAL_DEBUG.println(upload.currentSize);
+    if(fsUploadFile)
+      fsUploadFile.write(upload.buf, upload.currentSize);
+  } else if(upload.status == UPLOAD_FILE_END){
+    if(fsUploadFile)
+      fsUploadFile.close();
+    SERIAL_DEBUG.print("handleFileUpload Size: "); SERIAL_DEBUG.println(upload.totalSize);
+  }
+}
+
+
+void handleFileDelete(){
+  if(server.args() == 0) return server.send(500, "text/plain", "BAD ARGS");
+  String path = server.arg(0);
+  SERIAL_DEBUG.println("handleFileDelete: " + path);
+  if(path == "/")
+    return server.send(500, "text/plain", "BAD PATH");
+  if(!SPIFFS.exists(path))
+    return server.send(404, "text/plain", "FileNotFound");
+  SPIFFS.remove(path);
+  server.send(200, "text/plain", "");
+  path = String();
+}
+
+
+void handleFileCreate(){
+  if(server.args() == 0)
+    return server.send(500, "text/plain", "BAD ARGS");
+  String path = server.arg(0);
+  SERIAL_DEBUG.println("handleFileCreate: " + path);
+  if(path == "/")
+    return server.send(500, "text/plain", "BAD PATH");
+  if(SPIFFS.exists(path))
+    return server.send(500, "text/plain", "FILE EXISTS");
+  File file = SPIFFS.open(path, "w");
+  if(file)
+    file.close();
+  else
+    return server.send(500, "text/plain", "CREATE FAILED");
+  server.send(200, "text/plain", "");
+  path = String();
+}
+
+
+void handleFileList() {
+  if(!server.hasArg("dir")) {server.send(500, "text/plain", "BAD ARGS"); return;}
+  
+  String path = server.arg("dir");
+  SERIAL_DEBUG.println("handleFileList: " + path);
+  Dir dir = SPIFFS.openDir(path);
+  path = String();
+
+  String output = "[";
+  while(dir.next()){
+    File entry = dir.openFile("r");
+    if (output != "[") output += ',';
+    bool isDir = false;
+    output += "{\"type\":\"";
+    output += (isDir)?"dir":"file";
+    output += "\",\"name\":\"";
+    output += String(entry.name()).substring(1);
+    output += "\"}";
+    entry.close();
+  }
+  
+  output += "]";
+  server.send(200, "text/json", output);
+}
+
+
+bool handleFileRead(String path){
+  SERIAL_DEBUG.println("handleFileRead: " + path);
+  if(path.endsWith("/")) path += "index.htm";
+  String contentType = getContentType(path);
+  String pathWithGz = path + ".gz";
+  if(SPIFFS.exists(pathWithGz) || SPIFFS.exists(path)){
+    if(SPIFFS.exists(pathWithGz))
+      path += ".gz";
+    File file = SPIFFS.open(path, "r");
+    size_t sent = server.streamFile(file, contentType);
+    file.close();
+    return true;
+  }
+  return false;
+}
+
+
+bool handleProxy() {
+  SERIAL_DEBUG.println("handleProxy");
+
+  if (!server.hasArg("url")) {
+    SERIAL_DEBUG.println("url parameter is missing");
+    server.send(200, "text/plain", "Please use http://<this_device>/proxy?url=<encoded_url_without_http>"); 
+  }
+  else {    
+    String realUrl = urlDecode(server.arg("url"));
+    if (realUrl.indexOf("://") == -1) {
+      // No protocol. Add http://
+      realUrl = "http://" + realUrl;
+    }
+    if (realUrl.indexOf("/", 7 /* after the http:// */) == -1 && realUrl.indexOf("?") == -1) {
+      // Only a domain name. Add trailing slash 
+      // TODO: should handle the case where realUrl contains arguments: http://www.google.com?q=test
+      realUrl = realUrl + "/";
+    }
+    SERIAL_DEBUG.println(String("Real url is ") + realUrl);
+
+    /* Try to find it in cache */
+    int cacheIndex = -1;
+    long oldestCacheTime = -1;
+    int oldestCacheIndex = -1;
+    for (int i = 0; i < MAX_CACHE_ITEMS; i++) {
+      if (cachedUrl[i] == realUrl) {
+        SERIAL_DEBUG.println(String("Cache match ! This URL is entry #") + i);
+        cacheIndex = i; 
+      }
+      if (oldestCacheTime == -1 || cacheTime[i] < oldestCacheTime) {
+        oldestCacheTime = cacheTime[i];
+        oldestCacheIndex = i;
+      }
+    }
+
+    long itemCacheTime;
+    if (cacheIndex == -1) /* not found in cache */ {
+      SERIAL_DEBUG.println(String("Discarding oldest entry #") + cacheIndex + ": " + cachedUrl[cacheIndex]);
+      cacheIndex = oldestCacheIndex; /* recycle the oldest one */
+      itemCacheTime = -1;
+    }
+    else {
+      itemCacheTime = cacheTime[cacheIndex];
+    }
+
+    // Test if we can return the cached copy
+    long now = millis();
+
+    if (   itemCacheTime == -1 /* no cache */
+        || itemCacheTime > now /* millis() wrapped around */ 
+        || now - itemCacheTime > CACHE_TTL /* cache is outdated */) {
+
+      SERIAL_DEBUG.println("Fetching from server into cache");
+
+      // Configure client to retrieve Content-Type header
+      HTTPClient http;
+      const char * headerkeys[] = {"Content-Type", "Location"} ;
+      size_t headerkeyssize = sizeof(headerkeys)/sizeof(char*);
+      //ask to track these headers
+      http.collectHeaders(headerkeys, headerkeyssize );
+
+      // Init client
+      SERIAL_DEBUG.println("[HTTP] begin...");
+      http.begin(realUrl);
+          
+      // Connect to the real server
+      SERIAL_DEBUG.println("[HTTP] GET...");
+      int httpCode = http.GET();
+      if (httpCode < 0) {
+        SERIAL_DEBUG.print("[HTTP] GET failed, error: ");
+        SERIAL_DEBUG.println(http.errorToString(httpCode));
+        return false;
+      }
+      SERIAL_DEBUG.printf("[HTTP] Status code=%d\n", httpCode);
+      if (httpCode != HTTP_CODE_OK) {
+        SERIAL_DEBUG.println("[HTTP] Location is " + http.header("Location"));
+        return false;
+      }
+      
+      // Prepare cache file
+      File cache = SPIFFS.open(String("/cache/") + cacheIndex, "w");
+      if (!cache) {
+        SERIAL_DEBUG.println("Could not create cache file");
+      }
+
+      int len = http.getSize();
+      SERIAL_DEBUG.println("Response type:" + http.header("Content-Type") + " - Size=" + len);
+      WiFiClient* stream = http.getStreamPtr();
+      // read all data from server
+      while (http.connected() && (len > 0 || len == -1)) {
+        // get available data size
+        size_t size = stream->available();
+        if (size) {
+          // read up to buffer size
+          int c = stream->readBytes(buffer, ((size > sizeof(buffer)) ? sizeof(buffer) : size));
+          // write it to Serial
+          // SERIAL_DEBUG.write(buffer, c);
+          // write it to cache
+          cache.write(buffer, c);
+          if (len > 0) {
+            len -= c;
+          }
+        }
+        delay(1);
+      }
+      
+      cache.close();
+      cachedUrl[cacheIndex] = realUrl;
+      cacheTime[cacheIndex] = now;
+      if (http.hasHeader("Content-Type")) {
+        cacheContentType[cacheIndex] = http.header("Content-Type");
+      }
+      else {
+        // Fallback, probably missing index.html when omitted...
+        cacheContentType[cacheIndex] = getContentType(realUrl);
+      }
+      SERIAL_DEBUG.println(realUrl + " (type=" + cacheContentType[cacheIndex] + ") stored in cache entry #" + cacheIndex + " at " + now + "ms");
+    }
+  
+    // And return cached file to the browser
+    SERIAL_DEBUG.println("Returning contents from cache");
+    
+    // Open cache file for reading
+    File cache = SPIFFS.open(String("/cache/") + cacheIndex, "r");
+    if (!cache) {
+      SERIAL_DEBUG.println("Could not open cache file");
+    }
+    // And stream it back    
+    size_t sent = server.streamFile(cache, cacheContentType[cacheIndex]); 
+    cache.close();
+  }
+      
+  
+  SERIAL_DEBUG.println("Response sent");
+}
+
+
+void setup() {
+  SERIAL_DEBUG.begin(115200);
+  delay(10);
+   
+  SERIAL_DEBUG.println();
+  SERIAL_DEBUG.print("Initializing Wi-Fi");
+  // Connect to WiFi network   
+  WiFi.begin(ssid, password);   
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    SERIAL_DEBUG.print(".");
+  }
+  SERIAL_DEBUG.println(" Done.");
+
+  // Initialize SPIFFS and clear cache
+
+  SERIAL_DEBUG.println("Initializing SPIFFS cache...");
+  if (!SPIFFS.begin()) {
+    SERIAL_DEBUG.println("SPIFFS init failed");
+  }
+  Dir dir = SPIFFS.openDir("/cache");
+  while (dir.next()) {
+      SERIAL_DEBUG.println("Deleting " + dir.fileName());
+      SPIFFS.remove(dir.fileName());
+  }
+  for (int i = 0; i < MAX_CACHE_ITEMS; i++) {
+    cacheTime[i] = 0;
+    cachedUrl[i] = "";
+  }
+
+
+  // Initialize and start local web server
+
+  //list directory
+  server.on("/list", HTTP_GET, handleFileList);
+  //list directory
+  server.on("/proxy", HTTP_GET, handleProxy);
+  //load editor
+  server.on("/edit", HTTP_GET, [](){
+    if(!handleFileRead("/edit.htm")) server.send(404, "text/plain", "FileNotFound");
+  });
+  //create file
+  server.on("/edit", HTTP_PUT, handleFileCreate);
+  //delete file
+  server.on("/edit", HTTP_DELETE, handleFileDelete);
+  //first callback is called after the request has ended with all parsed arguments
+  //second callback handles file uploads at that location
+  server.on("/edit", HTTP_POST, [](){ server.send(200, "text/plain", ""); }, handleFileUpload);
+
+  //called when the url is not defined here
+  //use it to load content from SPIFFS
+  server.onNotFound([](){
+    if(!handleFileRead(server.uri()))
+      server.send(404, "text/plain", "FileNotFound");
+  });
+
+  //get heap status, analog input value and all GPIO statuses in one json call
+  server.on("/all", HTTP_GET, [](){
+    String json = "{";
+    json += "\"heap\":"+String(ESP.getFreeHeap());
+    json += ", \"analog\":"+String(analogRead(A0));
+    json += ", \"gpio\":"+String((uint32_t)(((GPI | GPO) & 0xFFFF) | ((GP16I & 0x01) << 16)));
+    json += "}";
+    server.send(200, "text/json", json);
+    json = String();
+  });
+  server.begin();
+  SERIAL_DEBUG.println("HTTP server started");
+
+
+  SERIAL_DEBUG.print("Ready. Please direct your browser to: http://");
+  SERIAL_DEBUG.println(WiFi.localIP());    
+}
+
+ 
+void loop() {
+  server.handleClient();
